@@ -7,7 +7,6 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Great+Vibes&family=Cormorant+Garamond:ital,wght@0,300;0,400;1,300&display=swap" rel="stylesheet">
-<script src="https://cdn.tailwindcss.com"></script>
 <style>
   * {
     margin: 0;
@@ -38,6 +37,7 @@
     position: absolute;
     inset: 0;
     display: block;
+    touch-action: none;
   }
 
   .center-text {
@@ -113,7 +113,7 @@
   <div class="greeting">Derin...</div>
 </div>
 
-<div class="hint">ekrana dokun</div>
+<div class="hint">dokun &middot; bas&#305;l&#305; tut &middot; s&uuml;r&uuml;kle</div>
 
 <script>
 (function () {
@@ -121,24 +121,29 @@
 
   const canvas = document.getElementById('fireworks');
   const ctx = canvas.getContext('2d', { alpha: false });
+  const TAU = Math.PI * 2;
 
   // ---------- Config ----------
-  // Total on-screen "particle budget" is kept well under 300 by splitting it
-  // between two cheap-to-draw pools (flowers are the expensive visual centerpiece,
-  // pollen are cheap glowing dots used for the firework-burst feel and sparkle-only bursts).
+  // Particle budget split across cheap pools: flowers are the expensive
+  // centerpiece, sparks (line-drawn, additive) carry the firework feel.
   const MAX_FLOWERS = 22;
-  const MAX_POLLEN = 140;
+  const MAX_POLLEN = 200;
   const PALETTE = ['#ffb7b2', '#e284ce', '#ff9eaa', '#ffdfba', '#d4a5a5', '#ffd6e8', '#f7cac9'];
   const GOLD = '#ffd88a';
   const LOVE_TEXT = 'Seni Seviyorum';
   const LOVE_CHANCE = 0.3;
+  const ROCKET_CHANCE = 0.5;
+  const HOLD_THRESHOLD = 260;   // ms before a press becomes a "charge"
+  const AUTO_FIREWORK_MS = 8000;
 
-  let dpr = Math.max(1, window.devicePixelRatio || 1);
+  // dpr capped at 2: phones with 3x screens gain nothing visible here
+  // but pay ~2.25x the fill cost
+  let dpr = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
   let width = 0;
   let height = 0;
 
   function resize() {
-    dpr = Math.max(1, window.devicePixelRatio || 1);
+    dpr = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
     width = window.innerWidth;
     height = window.innerHeight;
     canvas.width = Math.floor(width * dpr);
@@ -146,8 +151,6 @@
     canvas.style.width = width + 'px';
     canvas.style.height = height + 'px';
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    // opaque base so the very first frame isn't transparent, and so
-    // the trail effect always fades against solid black, never gray
     ctx.fillStyle = '#000000';
     ctx.fillRect(0, 0, width, height);
   }
@@ -167,24 +170,56 @@
     return arr[Math.floor(Math.random() * arr.length)];
   }
 
-  // ---------- Arrays (each capped independently, oldest culled first) ----------
+  function easeOutBack(x) {
+    const c1 = 1.70158;
+    const c3 = c1 + 1;
+    return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2);
+  }
+
+  function easeOutCubic(x) {
+    return 1 - Math.pow(1 - x, 3);
+  }
+
+  // ---------- Haptics ----------
+  // Android Chrome supports navigator.vibrate; iOS Safari silently lacks it.
+  function vibrate(pattern) {
+    if (navigator.vibrate) {
+      try { navigator.vibrate(pattern); } catch (e) { /* ignore */ }
+    }
+  }
+
+  const HAPTIC = {
+    flower: [25],
+    sparkle: [10, 30, 12],
+    bouquet: [18, 25, 18, 25, 35],
+    love: [12, 40, 12],
+    chargePulse: [14],
+    launch: [8]
+  };
+
+  // ---------- State pools ----------
   let flowers = [];
   let pollens = [];
   let floatingTexts = [];
   let ripples = [];
+  let shockwaves = [];
+  let rockets = [];
+  let stardust = [];
 
-  // ---------- Flower Class (blooming centerpiece) ----------
+  // ---------- Flower (blooming centerpiece) ----------
   class Flower {
     constructor(x, y, scaleBias) {
       this.x = x;
       this.y = y;
-      this.scale = 0; // starts at 0, blooms up via ease-out
+      this.t = 0; // bloom progress; eased with overshoot so petals "pop" open
+      this.bloomSpeed = rand(0.03, 0.045);
       this.maxScale = rand(0.45, 1.05) * (scaleBias || 1);
-      this.rotation = rand(0, Math.PI * 2);
+      this.scale = 0;
+      this.rotation = rand(0, TAU);
       this.spin = rand(-0.0025, 0.0025);
 
       this.life = 1;
-      this.decay = rand(0.0035, 0.0065); // blooms, lingers briefly, fades over ~3-5s
+      this.decay = rand(0.0035, 0.0065);
 
       this.type = pick(['lotus', 'sakura', 'rose']);
       this.color = pick(PALETTE);
@@ -193,7 +228,8 @@
     }
 
     update() {
-      this.scale += (this.maxScale - this.scale) * 0.09;
+      this.t = Math.min(1, this.t + this.bloomSpeed);
+      this.scale = this.maxScale * easeOutBack(this.t);
       this.rotation += this.spin;
       this.life -= this.decay;
       if (this.life <= 0) this.dead = true;
@@ -208,9 +244,8 @@
       ctx.globalAlpha = alpha;
 
       if (this.type === 'lotus') {
-        // 8 soft overlapping petals, single highlight pass — cheap and elegant
         for (let i = 0; i < 8; i++) {
-          ctx.rotate((Math.PI * 2) / 8);
+          ctx.rotate(TAU / 8);
           ctx.beginPath();
           ctx.moveTo(0, 0);
           ctx.quadraticCurveTo(20, -30, 0, -70);
@@ -226,9 +261,8 @@
           ctx.fill();
         }
       } else if (this.type === 'sakura') {
-        // 5 rounded cherry-blossom petals with a golden stamen core
         for (let i = 0; i < 5; i++) {
-          ctx.rotate((Math.PI * 2) / 5);
+          ctx.rotate(TAU / 5);
           ctx.beginPath();
           ctx.moveTo(0, 0);
           ctx.bezierCurveTo(25, -20, 25, -50, 0, -60);
@@ -236,33 +270,28 @@
           ctx.fillStyle = this.color;
           ctx.fill();
         }
-        // stamens drawn once, not per petal — same visual read, far fewer draw calls
         for (let i = 0; i < 5; i++) {
-          const a = (Math.PI * 2 * i) / 5;
-          const sx = Math.cos(a) * 22;
-          const sy = Math.sin(a) * 22;
+          const a = (TAU * i) / 5;
           ctx.beginPath();
-          ctx.arc(sx, sy, 2.6, 0, Math.PI * 2);
+          ctx.arc(Math.cos(a) * 22, Math.sin(a) * 22, 2.6, 0, TAU);
           ctx.fillStyle = this.coreColor;
           ctx.fill();
         }
       } else {
-        // rose: 3 concentric layers instead of 5 — visually full, ~60% cheaper to draw
         const layers = 3;
         for (let j = layers; j > 0; j--) {
           const radius = j * 11;
           const petals = 4 + j;
           ctx.fillStyle = j % 2 === 0 ? this.color : '#ffc1cc';
           for (let i = 0; i < petals; i++) {
-            ctx.rotate((Math.PI * 2) / petals + j * 0.35);
+            ctx.rotate(TAU / petals + j * 0.35);
             ctx.beginPath();
-            ctx.arc(0, -radius * 0.6, radius, 0, Math.PI * 2);
+            ctx.arc(0, -radius * 0.6, radius, 0, TAU);
             ctx.fill();
           }
         }
-        // single soft core to finish the read
         ctx.beginPath();
-        ctx.arc(0, 0, 6, 0, Math.PI * 2);
+        ctx.arc(0, 0, 6, 0, TAU);
         ctx.fillStyle = this.coreColor;
         ctx.fill();
       }
@@ -271,60 +300,82 @@
     }
   }
 
-  // ---------- Pollen Class (firework sparks / magical dust) ----------
-  // Real physics: velocity, friction, gravity — this is what gives the "havai fişek" burst feel.
+  // ---------- Spark / Pollen (line-drawn firework spark) ----------
+  // Draws a short streak from its previous position — the classic firework
+  // trail — plus a bright white-hot core. Rendered with additive blending.
   class Pollen {
-    constructor(x, y, angle, gold) {
-      this.reset(x, y, angle, gold);
+    constructor(x, y, angle, opts) {
+      this.reset(x, y, angle, opts);
     }
 
-    reset(x, y, angle, gold) {
-      this.x = x;
-      this.y = y;
-      this.gold = !!gold;
+    reset(x, y, angle, opts) {
+      opts = opts || {};
+      this.x = this.px = x;
+      this.y = this.py = y;
+      this.gold = !!opts.gold;
 
-      const speed = rand(1.8, 6.5);
+      const speed = opts.speed !== undefined ? opts.speed : rand(1.8, 7.2);
       this.vx = Math.cos(angle) * speed;
       this.vy = Math.sin(angle) * speed;
 
       this.friction = rand(0.94, 0.972);
-      this.gravity = rand(0.015, 0.045);
+      this.gravity = opts.gravity !== undefined ? opts.gravity : rand(0.02, 0.05);
 
-      this.size = this.gold ? rand(1.6, 3.2) : rand(2, 4.2);
-      this.color = this.gold ? GOLD : pick(PALETTE);
+      this.size = this.gold ? rand(1.1, 2.2) : rand(1.4, 2.8);
+      this.color = opts.color || (this.gold ? GOLD : pick(PALETTE));
 
       this.life = 1;
-      this.decay = rand(0.01, 0.02);
+      this.decay = opts.decay !== undefined ? opts.decay : rand(0.009, 0.018);
+      this.twinkle = rand(0, TAU);
+      this.twinkleSpeed = rand(0.18, 0.5);
+      // some sparks pop a tiny secondary "crackle" as they die
+      this.canCrackle = !opts.noCrackle && Math.random() < 0.28;
       this.dead = false;
     }
 
     update() {
+      this.px = this.x;
+      this.py = this.y;
       this.vx *= this.friction;
       this.vy *= this.friction;
       this.vy += this.gravity;
-
       this.x += this.vx;
       this.y += this.vy;
-
+      this.twinkle += this.twinkleSpeed;
       this.life -= this.decay;
-      if (this.life <= 0) this.dead = true;
+      if (this.life <= 0) {
+        this.dead = true;
+        if (this.canCrackle) crackle(this.x, this.y);
+      }
     }
 
     draw(ctx) {
-      const alpha = Math.max(0, this.life);
-      ctx.save();
-      ctx.globalAlpha = alpha;
+      const flicker = 0.72 + 0.28 * Math.sin(this.twinkle);
+      const alpha = Math.max(0, this.life) * flicker;
+      const dx = this.x - this.px;
+      const dy = this.y - this.py;
+
+      ctx.globalAlpha = alpha * 0.85;
+      ctx.strokeStyle = this.color;
+      ctx.lineWidth = this.size;
+      ctx.lineCap = 'round';
       ctx.beginPath();
-      ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
-      ctx.fillStyle = this.color;
-      ctx.shadowColor = this.color;
-      ctx.shadowBlur = this.size * 3;
+      if (dx * dx + dy * dy > 0.25) {
+        ctx.moveTo(this.px, this.py);
+        ctx.lineTo(this.x, this.y);
+        ctx.stroke();
+      }
+
+      // white-hot core dot
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = '#fff6ea';
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, this.size * 0.5, 0, TAU);
       ctx.fill();
-      ctx.restore();
     }
   }
 
-  // ---------- Pooled spawning with hard caps (culls oldest first) ----------
+  // ---------- Pooled spawning with hard caps ----------
 
   function spawnFlower(x, y, scaleBias) {
     for (let i = 0; i < flowers.length; i++) {
@@ -339,23 +390,38 @@
     }
   }
 
-  function spawnPollen(x, y, angle, gold) {
+  function spawnPollen(x, y, angle, opts) {
     for (let i = 0; i < pollens.length; i++) {
       if (pollens[i].dead) {
-        pollens[i].reset(x, y, angle, gold);
+        pollens[i].reset(x, y, angle, opts);
         return;
       }
     }
-    pollens.push(new Pollen(x, y, angle, gold));
+    pollens.push(new Pollen(x, y, angle, opts));
     if (pollens.length > MAX_POLLEN) {
       pollens.splice(0, pollens.length - MAX_POLLEN);
     }
   }
 
-  function spawnPollenBurst(x, y, count, allGold) {
+  function spawnPollenBurst(x, y, count, allGold, speedScale) {
     for (let i = 0; i < count; i++) {
-      const angle = rand(0, Math.PI * 2);
-      spawnPollen(x, y, angle, allGold || Math.random() < 0.35);
+      const angle = rand(0, TAU);
+      spawnPollen(x, y, angle, {
+        gold: allGold || Math.random() < 0.35,
+        speed: rand(1.8, 7.2) * (speedScale || 1)
+      });
+    }
+  }
+
+  function crackle(x, y) {
+    for (let i = 0; i < randInt(4, 6); i++) {
+      spawnPollen(x, y, rand(0, TAU), {
+        gold: true,
+        speed: rand(0.6, 2.2),
+        decay: rand(0.03, 0.055),
+        gravity: 0.03,
+        noCrackle: true
+      });
     }
   }
 
@@ -367,7 +433,7 @@
       this.y = y;
       this.vy = rand(-0.85, -0.55);
       this.life = 1;
-      this.decay = rand(0.0055, 0.0075); // ~2.2 - 3s at 60fps
+      this.decay = rand(0.0055, 0.0075);
       this.scale = rand(0.92, 1.08);
       this.color = pick(['#ffd1dc', '#f3c6e0', '#ffe3ea']);
       this.drift = rand(-0.15, 0.15);
@@ -399,7 +465,7 @@
     }
   }
 
-  // ---------- Subtle tap ripple ----------
+  // ---------- Tap ripple ----------
 
   function addRipple(x, y, color) {
     ripples.push({ x, y, r: 0, maxR: rand(55, 100), alpha: 0.4, color });
@@ -414,57 +480,336 @@
         ripples.splice(i, 1);
         continue;
       }
-      ctx.save();
       ctx.globalAlpha = Math.max(0, rp.alpha);
       ctx.strokeStyle = rp.color;
       ctx.lineWidth = 1.1;
       ctx.beginPath();
-      ctx.arc(rp.x, rp.y, rp.r, 0, Math.PI * 2);
+      ctx.arc(rp.x, rp.y, rp.r, 0, TAU);
       ctx.stroke();
-      ctx.restore();
     }
   }
 
-  // ---------- Burst logic: pattern varies every single tap ---------- 
+  // ---------- Shockwave flash (soft radial halo at the moment of burst) ----------
 
-  function triggerBurst(x, y) {
+  function addShockwave(x, y, scale) {
+    shockwaves.push({ x, y, r: 6, maxR: rand(90, 140) * (scale || 1), alpha: 0.55 });
+  }
+
+  function updateAndDrawShockwaves(ctx) {
+    for (let i = shockwaves.length - 1; i >= 0; i--) {
+      const s = shockwaves[i];
+      s.r += (s.maxR - s.r) * 0.2;
+      s.alpha *= 0.86;
+      if (s.alpha < 0.02) {
+        shockwaves.splice(i, 1);
+        continue;
+      }
+      const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, s.r);
+      g.addColorStop(0, 'rgba(255, 226, 236, 0.5)');
+      g.addColorStop(0.55, 'rgba(255, 190, 210, 0.18)');
+      g.addColorStop(1, 'rgba(255, 190, 210, 0)');
+      ctx.globalAlpha = s.alpha;
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, s.r, 0, TAU);
+      ctx.fill();
+    }
+  }
+
+  // ---------- Rocket (launch phase: rises from the bottom, then bursts) ----------
+
+  class Rocket {
+    constructor(targetX, targetY, power) {
+      this.startX = targetX + rand(-30, 30);
+      this.startY = height + 12;
+      this.targetX = targetX;
+      this.targetY = targetY;
+      this.power = power || 1;
+      this.t = 0;
+      this.speed = 1 / rand(26, 34); // ~430-560ms flight
+      this.sway = rand(3, 8) * (Math.random() < 0.5 ? -1 : 1);
+      this.x = this.startX;
+      this.y = this.startY;
+      this.dead = false;
+    }
+
+    update() {
+      this.t += this.speed;
+      if (this.t >= 1) {
+        this.dead = true;
+        triggerBurst(this.targetX, this.targetY, this.power);
+        return;
+      }
+      const e = easeOutCubic(this.t);
+      this.x = this.startX + (this.targetX - this.startX) * e + Math.sin(this.t * Math.PI * 2) * this.sway * (1 - this.t);
+      this.y = this.startY + (this.targetY - this.startY) * e;
+
+      // sparkling exhaust trail
+      if (Math.random() < 0.85) {
+        spawnPollen(this.x, this.y, rand(0, TAU), {
+          gold: true,
+          speed: rand(0.2, 0.9),
+          gravity: 0.05,
+          decay: rand(0.04, 0.07),
+          noCrackle: true
+        });
+      }
+    }
+
+    draw(ctx) {
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#fff2dc';
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, 2.4, 0, TAU);
+      ctx.fill();
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = GOLD;
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, 5.5, 0, TAU);
+      ctx.fill();
+    }
+  }
+
+  function launchRocket(x, y, power) {
+    rockets.push(new Rocket(x, y, power));
+    if (rockets.length > 6) rockets.shift();
+    vibrate(HAPTIC.launch);
+  }
+
+  // ---------- Ambient stardust (slow drifting background sparkle) ----------
+
+  function initStardust() {
+    stardust = [];
+    const count = Math.min(40, Math.floor((width * height) / 22000));
+    for (let i = 0; i < count; i++) {
+      stardust.push({
+        x: rand(0, width),
+        y: rand(0, height),
+        vy: rand(-0.12, -0.04),
+        vx: rand(-0.03, 0.03),
+        size: rand(0.5, 1.4),
+        phase: rand(0, TAU),
+        phaseSpeed: rand(0.008, 0.03)
+      });
+    }
+  }
+
+  function updateAndDrawStardust(ctx) {
+    for (let i = 0; i < stardust.length; i++) {
+      const s = stardust[i];
+      s.x += s.vx;
+      s.y += s.vy;
+      s.phase += s.phaseSpeed;
+      if (s.y < -4) { s.y = height + 4; s.x = rand(0, width); }
+      if (s.x < -4) s.x = width + 4;
+      if (s.x > width + 4) s.x = -4;
+      ctx.globalAlpha = 0.1 + 0.14 * (0.5 + 0.5 * Math.sin(s.phase));
+      ctx.fillStyle = '#ffe9f0';
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, s.size, 0, TAU);
+      ctx.fill();
+    }
+  }
+
+  window.addEventListener('resize', initStardust);
+  initStardust();
+
+  // ---------- Burst logic: pattern varies every tap; power scales it ----------
+
+  function triggerBurst(x, y, power) {
+    power = power || 1;
     const roll = Math.random();
 
+    addShockwave(x, y, power);
+
     if (roll < 0.15) {
-      // sparkle-only burst: just glowing gold dust, no flower
-      spawnPollenBurst(x, y, randInt(22, 34), true);
+      spawnPollenBurst(x, y, Math.round(randInt(22, 34) * power), true, power);
+      vibrate(HAPTIC.sparkle);
     } else if (roll < 0.7) {
-      // one flower blooming with a light halo of colored sparks around it
-      spawnFlower(x, y, rand(0.85, 1.15));
-      spawnPollenBurst(x, y, randInt(10, 20), false);
+      spawnFlower(x, y, rand(0.85, 1.15) * power);
+      spawnPollenBurst(x, y, Math.round(randInt(12, 22) * power), false, power);
+      vibrate(power > 1.3 ? HAPTIC.bouquet : HAPTIC.flower);
     } else {
-      // a fuller bouquet: 2-3 smaller flowers scattered near the tap point
       const count = randInt(2, 3);
       for (let i = 0; i < count; i++) {
-        const ox = x + rand(-46, 46);
-        const oy = y + rand(-46, 46);
-        spawnFlower(ox, oy, rand(0.45, 0.75));
+        spawnFlower(x + rand(-46, 46) * power, y + rand(-46, 46) * power, rand(0.45, 0.75) * power);
       }
-      spawnPollenBurst(x, y, randInt(16, 28), false);
+      spawnPollenBurst(x, y, Math.round(randInt(18, 30) * power), false, power);
+      vibrate(HAPTIC.bouquet);
     }
 
     addRipple(x, y, pick(PALETTE));
 
     if (Math.random() < LOVE_CHANCE) {
       floatingTexts.push(new FloatingText(x, y));
+      vibrate(HAPTIC.love);
     }
+  }
+
+  // ---------- Press / hold / drag handling (pointer events) ----------
+
+  const pointers = new Map();
+  let lastActivity = performance.now();
+
+  function pointerDown(e) {
+    lastActivity = performance.now();
+    pointers.set(e.pointerId, {
+      x: e.clientX,
+      y: e.clientY,
+      startX: e.clientX,
+      startY: e.clientY,
+      start: performance.now(),
+      lastPulse: 0,
+      moved: false
+    });
+  }
+
+  function pointerMove(e) {
+    const p = pointers.get(e.pointerId);
+    if (!p) return;
+    lastActivity = performance.now();
+
+    const dx = e.clientX - p.x;
+    const dy = e.clientY - p.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+
+    if (dist > 5) {
+      // golden dust scattered along the finger's path
+      const steps = Math.min(4, Math.floor(dist / 6));
+      for (let i = 0; i < steps; i++) {
+        const t = (i + 1) / steps;
+        spawnPollen(p.x + dx * t, p.y + dy * t, rand(0, TAU), {
+          gold: Math.random() < 0.7,
+          speed: rand(0.3, 1.4),
+          gravity: 0.02,
+          decay: rand(0.025, 0.05),
+          noCrackle: true
+        });
+      }
+      p.x = e.clientX;
+      p.y = e.clientY;
+      const tdx = e.clientX - p.startX;
+      const tdy = e.clientY - p.startY;
+      if (tdx * tdx + tdy * tdy > 400) p.moved = true;
+    }
+  }
+
+  function pointerUp(e) {
+    const p = pointers.get(e.pointerId);
+    if (!p) return;
+    pointers.delete(e.pointerId);
+    lastActivity = performance.now();
+
+    const held = performance.now() - p.start;
+
+    if (p.moved) {
+      // a drag ends with a soft sparkle where the finger lifted
+      spawnPollenBurst(e.clientX, e.clientY, 8, true, 0.6);
+      vibrate(HAPTIC.launch);
+      return;
+    }
+
+    if (held >= HOLD_THRESHOLD) {
+      // charged burst: the longer the hold, the bigger the release
+      const power = 1 + Math.min(1.5, (held - HOLD_THRESHOLD) / 900);
+      triggerBurst(e.clientX, e.clientY, power);
+      vibrate([Math.round(20 + power * 25)]);
+      return;
+    }
+
+    // quick tap: half the time a rocket climbs up to the point, half instant
+    if (Math.random() < ROCKET_CHANCE && e.clientY < height - 60) {
+      launchRocket(e.clientX, e.clientY);
+    } else {
+      triggerBurst(e.clientX, e.clientY, 1);
+    }
+  }
+
+  canvas.addEventListener('pointerdown', pointerDown);
+  canvas.addEventListener('pointermove', pointerMove);
+  canvas.addEventListener('pointerup', pointerUp);
+  canvas.addEventListener('pointercancel', (e) => pointers.delete(e.pointerId));
+
+  // block pull-to-refresh / page bounce / pinch-zoom entirely
+  document.addEventListener('touchmove', (e) => {
+    e.preventDefault();
+  }, { passive: false });
+
+  document.addEventListener('gesturestart', (e) => {
+    e.preventDefault();
+  });
+
+  // ---------- Charge orb (drawn while a press is held) ----------
+
+  function drawChargingPointers(ctx, now) {
+    pointers.forEach((p) => {
+      const held = now - p.start;
+      if (p.moved || held < HOLD_THRESHOLD) return;
+
+      const charge = Math.min(1, (held - HOLD_THRESHOLD) / 1350);
+      const radius = 10 + charge * 42 + Math.sin(now * 0.012) * 3;
+
+      const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, radius);
+      g.addColorStop(0, 'rgba(255, 240, 245, 0.85)');
+      g.addColorStop(0.5, 'rgba(255, 183, 178, 0.35)');
+      g.addColorStop(1, 'rgba(255, 183, 178, 0)');
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, radius, 0, TAU);
+      ctx.fill();
+
+      // orbiting sparks hint that energy is building
+      if (Math.random() < 0.35 + charge * 0.4) {
+        const a = rand(0, TAU);
+        spawnPollen(p.x + Math.cos(a) * radius, p.y + Math.sin(a) * radius, a + Math.PI / 2, {
+          gold: true,
+          speed: rand(0.4, 1.2),
+          gravity: -0.01,
+          decay: rand(0.03, 0.06),
+          noCrackle: true
+        });
+      }
+
+      // heartbeat pulse in the hand while charging
+      if (now - p.lastPulse > 380 - charge * 160) {
+        p.lastPulse = now;
+        vibrate(HAPTIC.chargePulse);
+      }
+    });
   }
 
   // ---------- Main loop ----------
 
   let frameCount = 0;
+  let lastAuto = performance.now();
 
   function loop() {
-    // trail effect instead of clearRect — gives the soft, dreamy fade
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.15)';
+    const now = performance.now();
+
+    // trail fade against solid black — gives the soft, dreamy persistence
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.18)';
     ctx.fillRect(0, 0, width, height);
 
+    // additive pass: everything glowy stacks into brighter light
+    ctx.globalCompositeOperation = 'lighter';
+
+    updateAndDrawStardust(ctx);
+    updateAndDrawShockwaves(ctx);
     updateAndDrawRipples(ctx);
+    drawChargingPointers(ctx, now);
+
+    for (let i = rockets.length - 1; i >= 0; i--) {
+      const r = rockets[i];
+      r.update();
+      if (r.dead) {
+        rockets.splice(i, 1);
+        continue;
+      }
+      r.draw(ctx);
+    }
 
     for (let i = 0; i < pollens.length; i++) {
       const p = pollens[i];
@@ -472,6 +817,9 @@
       p.update();
       if (!p.dead) p.draw(ctx);
     }
+
+    // opaque shapes read better without additive blowout
+    ctx.globalCompositeOperation = 'source-over';
 
     for (let i = 0; i < flowers.length; i++) {
       const f = flowers[i];
@@ -490,7 +838,12 @@
       t.draw(ctx);
     }
 
-    // periodically compact pooled arrays so dead slots never accumulate indefinitely
+    // idle magic: a small firework climbs up on its own when she just watches
+    if (now - lastActivity > AUTO_FIREWORK_MS && now - lastAuto > AUTO_FIREWORK_MS) {
+      lastAuto = now;
+      launchRocket(rand(width * 0.2, width * 0.8), rand(height * 0.2, height * 0.55), rand(0.6, 0.85));
+    }
+
     frameCount++;
     if (frameCount % 180 === 0) {
       flowers = flowers.filter((f) => !f.dead);
@@ -502,32 +855,10 @@
 
   requestAnimationFrame(loop);
 
-  // ---------- Input handling ----------
-
-  canvas.addEventListener('mousedown', (e) => {
-    triggerBurst(e.clientX, e.clientY);
-  });
-
-  window.addEventListener('touchstart', (e) => {
-    e.preventDefault();
-    for (const touch of e.changedTouches) {
-      triggerBurst(touch.clientX, touch.clientY);
-    }
-  }, { passive: false });
-
-  // block pull-to-refresh / page bounce / pinch-zoom entirely
-  document.addEventListener('touchmove', (e) => {
-    e.preventDefault();
-  }, { passive: false });
-
-  document.addEventListener('gesturestart', (e) => {
-    e.preventDefault();
-  });
-
   // small opening bloom so the page doesn't feel empty before the first touch
   window.addEventListener('load', () => {
     setTimeout(() => {
-      triggerBurst(width / 2, height * 0.42);
+      launchRocket(width / 2, height * 0.42, 1);
     }, 700);
   });
 
